@@ -1,0 +1,257 @@
+name: Deploy to Azure
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      environmentName:
+        description: 'Environment name (overrides AZURE_ENV_NAME variable)'
+        required: false
+        default: ''
+      location:
+        description: 'Azure region (overrides AZURE_LOCATION variable)'
+        required: false
+        default: ''
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  DEPLOYMENT_PREFIX: aiforitops
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set deployment parameters
+        id: params
+        run: |
+          ENV_NAME="${{ inputs.environmentName }}"
+          if [ -z "$ENV_NAME" ]; then
+            ENV_NAME="${{ vars.AZURE_ENV_NAME }}"
+          fi
+          if [ -z "$ENV_NAME" ]; then
+            echo "Environment name is required. Set AZURE_ENV_NAME variable or provide workflow input."
+            exit 1
+          fi
+
+          LOCATION="${{ inputs.location }}"
+          if [ -z "$LOCATION" ]; then
+            LOCATION="${{ vars.AZURE_LOCATION }}"
+          fi
+          if [ -z "$LOCATION" ]; then
+            echo "Azure location is required. Set AZURE_LOCATION variable or provide workflow input."
+            exit 1
+          fi
+
+          OPENAI_LOCATION="${{ vars.AZURE_OPENAI_LOCATION }}"
+          if [ -z "$OPENAI_LOCATION" ]; then
+            OPENAI_LOCATION="westus"
+          fi
+
+          echo "environment_name=$ENV_NAME" >> "$GITHUB_OUTPUT"
+          echo "location=$LOCATION" >> "$GITHUB_OUTPUT"
+          echo "openai_location=$OPENAI_LOCATION" >> "$GITHUB_OUTPUT"
+          echo "deployment_name=${{ env.DEPLOYMENT_PREFIX }}-${ENV_NAME}" >> "$GITHUB_OUTPUT"
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Provision infrastructure (Bicep)
+        run: |
+          az deployment sub create \
+            --name "${{ steps.params.outputs.deployment_name }}" \
+            --location "${{ steps.params.outputs.location }}" \
+            --template-file infra/main.bicep \
+            --parameters \
+              environmentName="${{ steps.params.outputs.environment_name }}" \
+              location="${{ steps.params.outputs.location }}" \
+              openAiLocation="${{ steps.params.outputs.openai_location }}" \
+              principalId="${{ vars.AZURE_PRINCIPAL_ID }}"
+
+      - name: Read deployment outputs
+        id: outputs
+        run: |
+          OUTPUTS=$(az deployment sub show \
+            --name "${{ steps.params.outputs.deployment_name }}" \
+            --query properties.outputs -o json)
+
+          echo "resource_group=$(echo "$OUTPUTS" | jq -r '.AZURE_RESOURCE_GROUP.value')" >> "$GITHUB_OUTPUT"
+          echo "acr_name=$(echo "$OUTPUTS" | jq -r '.AZURE_CONTAINER_REGISTRY_NAME.value')" >> "$GITHUB_OUTPUT"
+          echo "acr_login_server=$(echo "$OUTPUTS" | jq -r '.AZURE_CONTAINER_REGISTRY_ENDPOINT.value')" >> "$GITHUB_OUTPUT"
+          echo "aks_cluster_name=$(echo "$OUTPUTS" | jq -r '.AZURE_AKS_CLUSTER_NAME.value')" >> "$GITHUB_OUTPUT"
+          echo "key_vault_name=$(echo "$OUTPUTS" | jq -r '.AZURE_KEY_VAULT_NAME.value')" >> "$GITHUB_OUTPUT"
+          echo "tenant_id=$(echo "$OUTPUTS" | jq -r '.AZURE_TENANT_ID.value')" >> "$GITHUB_OUTPUT"
+          echo "managed_identity_client_id=$(echo "$OUTPUTS" | jq -r '.AZURE_MANAGED_IDENTITY_CLIENT_ID.value')" >> "$GITHUB_OUTPUT"
+          echo "managed_identity_id=$(echo "$OUTPUTS" | jq -r '.AZURE_MANAGED_IDENTITY_ID.value')" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push StoreFront image
+        run: |
+          az acr build \
+            --registry "${{ steps.outputs.outputs.acr_name }}" \
+            --image storefront:latest \
+            --file StoreFront/Dockerfile \
+            .
+
+      - name: Build and push AdminSite image
+        run: |
+          az acr build \
+            --registry "${{ steps.outputs.outputs.acr_name }}" \
+            --image adminsite:latest \
+            --file AdminSite/Dockerfile \
+            .
+
+      - name: Build and push ProductWorker image
+        run: |
+          az acr build \
+            --registry "${{ steps.outputs.outputs.acr_name }}" \
+            --image productworker:latest \
+            --file ProductWorker/Dockerfile \
+            .
+
+      - name: Configure AKS cluster
+        run: |
+          RESOURCE_GROUP="${{ steps.outputs.outputs.resource_group }}"
+          AKS_CLUSTER_NAME="${{ steps.outputs.outputs.aks_cluster_name }}"
+          ACR_NAME="${{ steps.outputs.outputs.acr_name }}"
+          MANAGED_IDENTITY_ID="${{ steps.outputs.outputs.managed_identity_id }}"
+
+          echo "Getting AKS credentials..."
+          az aks get-credentials \
+            --resource-group "$RESOURCE_GROUP" \
+            --name "$AKS_CLUSTER_NAME" \
+            --overwrite-existing
+
+          echo "Attaching ACR to AKS..."
+          az aks update \
+            --name "$AKS_CLUSTER_NAME" \
+            --resource-group "$RESOURCE_GROUP" \
+            --attach-acr "$ACR_NAME"
+
+          echo "Assigning managed identity to user node pool VMSS..."
+          VMSS_RESOURCE_GROUP=$(az aks show \
+            --resource-group "$RESOURCE_GROUP" \
+            --name "$AKS_CLUSTER_NAME" \
+            --query "nodeResourceGroup" -o tsv)
+          VMSS_NODEPOOL_NAME=$(az vmss list \
+            --resource-group "$VMSS_RESOURCE_GROUP" \
+            --query "[].name" -o tsv | grep userpool || true)
+
+          if [ -n "$VMSS_NODEPOOL_NAME" ]; then
+            az vmss identity assign \
+              --resource-group "$VMSS_RESOURCE_GROUP" \
+              --name "$VMSS_NODEPOOL_NAME" \
+              --identities "$MANAGED_IDENTITY_ID"
+            az vmss update-instances \
+              -g "$VMSS_RESOURCE_GROUP" \
+              -n "$VMSS_NODEPOOL_NAME" \
+              --instance-ids "*"
+          else
+            echo "Warning: user node pool VMSS not found. Skipping managed identity assignment."
+          fi
+
+          echo "Labeling user pool nodes with workload=true..."
+          kubectl get nodes -l agentpool=userpool -o name | \
+            xargs -r -I {} kubectl label {} workload=true --overwrite
+
+          echo "Creating ai-demo namespace..."
+          kubectl create namespace ai-demo --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Prepare Kubernetes manifests
+        run: |
+          K8S_DIR="${{ runner.temp }}/k8s-final"
+          mkdir -p "$K8S_DIR"
+
+          ACR_LOGIN_SERVER="${{ steps.outputs.outputs.acr_login_server }}"
+          KEY_VAULT_NAME="${{ steps.outputs.outputs.key_vault_name }}"
+          TENANT_ID="${{ steps.outputs.outputs.tenant_id }}"
+          MANAGED_IDENTITY_CLIENT_ID="${{ steps.outputs.outputs.managed_identity_client_id }}"
+
+          for file in storefront-deployment.yaml adminsite-deployment.yaml productworker-deployment.yaml; do
+            sed "s|<your_acrname>\.azurecr\.io|${ACR_LOGIN_SERVER}|g" \
+              "k8s/${file}" > "${K8S_DIR}/${file%.yaml}.final.yaml"
+          done
+
+          for file in \
+            keyvault-cosmosdb-spc.yaml \
+            keyvault-servicebus-spc.yaml \
+            keyvault-openai-spc.yaml \
+            keyvault-openai-key-spc.yaml \
+            keyvault-openai-deployment-spc.yaml; do
+            sed -e "s|\${KEY_VAULT_NAME}|${KEY_VAULT_NAME}|g" \
+                -e "s|\${TENANT_ID}|${TENANT_ID}|g" \
+                -e "s|\${MANAGED_IDENTITY_CLIENT_ID}|${MANAGED_IDENTITY_CLIENT_ID}|g" \
+              "k8s/${file}" > "${K8S_DIR}/${file%.yaml}.final.yaml"
+          done
+
+          cp k8s/cosmosdb-configmap.yaml "$K8S_DIR/"
+          cp k8s/servicebus-configmap.yaml "$K8S_DIR/"
+          cp k8s/storefront-service.yaml "$K8S_DIR/"
+          cp k8s/adminsite-service.yaml "$K8S_DIR/"
+
+          echo "K8S_FINAL_DIR=$K8S_DIR" >> "$GITHUB_ENV"
+
+      - name: Deploy to Kubernetes
+        run: |
+          K8S_DIR="${{ env.K8S_FINAL_DIR }}"
+
+          kubectl apply -f "$K8S_DIR/cosmosdb-configmap.yaml" -n ai-demo
+          kubectl apply -f "$K8S_DIR/servicebus-configmap.yaml" -n ai-demo
+
+          kubectl apply -f "$K8S_DIR/keyvault-cosmosdb-spc.final.yaml" -n ai-demo
+          kubectl apply -f "$K8S_DIR/keyvault-servicebus-spc.final.yaml" -n ai-demo
+          kubectl apply -f "$K8S_DIR/keyvault-openai-spc.final.yaml" -n ai-demo
+          kubectl apply -f "$K8S_DIR/keyvault-openai-key-spc.final.yaml" -n ai-demo
+          kubectl apply -f "$K8S_DIR/keyvault-openai-deployment-spc.final.yaml" -n ai-demo
+
+          sleep 5
+
+          kubectl apply -f "$K8S_DIR/storefront-deployment.final.yaml" -n ai-demo
+          kubectl apply -f "$K8S_DIR/storefront-service.yaml" -n ai-demo
+          kubectl apply -f "$K8S_DIR/adminsite-deployment.final.yaml" -n ai-demo
+          kubectl apply -f "$K8S_DIR/adminsite-service.yaml" -n ai-demo
+          kubectl apply -f "$K8S_DIR/productworker-deployment.final.yaml" -n ai-demo
+
+      - name: Write deployment summary
+        run: |
+          echo "Waiting for LoadBalancer external IPs..."
+          sleep 15
+
+          STOREFRONT_IP=$(kubectl get svc storefront -n ai-demo -o jsonpath="{.status.loadBalancer.ingress[0].ip}" 2>/dev/null || true)
+          ADMINSITE_IP=$(kubectl get svc adminsite -n ai-demo -o jsonpath="{.status.loadBalancer.ingress[0].ip}" 2>/dev/null || true)
+
+          {
+            echo "## Deployment Summary"
+            echo ""
+            echo "| Setting | Value |"
+            echo "|---------|-------|"
+            echo "| Environment | ${{ steps.params.outputs.environment_name }} |"
+            echo "| Location | ${{ steps.params.outputs.location }} |"
+            echo "| Resource Group | ${{ steps.outputs.outputs.resource_group }} |"
+            echo "| AKS Cluster | ${{ steps.outputs.outputs.aks_cluster_name }} |"
+            echo "| ACR | ${{ steps.outputs.outputs.acr_name }} |"
+            echo "| Key Vault | ${{ steps.outputs.outputs.key_vault_name }} |"
+            echo ""
+            echo "### Application URLs"
+            echo ""
+            if [ -n "$STOREFRONT_IP" ]; then
+              echo "- **StoreFront:** http://${STOREFRONT_IP}"
+            else
+              echo "- **StoreFront:** External IP pending (run \`kubectl get svc storefront -n ai-demo\`)"
+            fi
+            if [ -n "$ADMINSITE_IP" ]; then
+              echo "- **AdminSite:** http://${ADMINSITE_IP}"
+            else
+              echo "- **AdminSite:** External IP pending (run \`kubectl get svc adminsite -n ai-demo\`)"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
