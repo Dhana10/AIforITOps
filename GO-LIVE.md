@@ -136,8 +136,8 @@ git push origin main
 
 ## 8. Trigger and monitor the workflow
 
-- [ ] The push above auto-triggers it. Or run manually.
-- [ ] Watch the run to completion.
+- [x] The push above auto-triggers it. Or run manually.
+- [x] Watch the run to completion.
 
 ```bash
 # manual trigger (optional)
@@ -151,7 +151,7 @@ gh run watch --repo "$GITHUB_REPO" "$(gh run list --repo "$GITHUB_REPO" --limit 
 
 ## 9. Verify the deployment
 
-- [ ] Pods running, services have external IPs, apps reachable.
+- [x] Pods running, services have external IPs, apps reachable.
 
 ```bash
 RESOURCE_GROUP="rg-$AZURE_ENV_NAME"
@@ -177,5 +177,5 @@ App URLs are also written to the workflow's **job summary** (StoreFront + AdminS
 | 5 | GitHub variables | [x] |
 | 6 | OpenAI quota | [x] |
 | 7 | Push deployment files | [x] |
-| 8 | Run workflow | [ ] |
-| 9 | Verify live | [ ] |
+| 8 | Run workflow | [x] |
+| 9 | Verify live | [x] |
