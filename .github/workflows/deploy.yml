@@ -86,14 +86,19 @@ jobs:
             --name "${{ steps.params.outputs.deployment_name }}" \
             --query properties.outputs -o json)
 
-          echo "resource_group=$(echo "$OUTPUTS" | jq -r '.AZURE_RESOURCE_GROUP.value')" >> "$GITHUB_OUTPUT"
-          echo "acr_name=$(echo "$OUTPUTS" | jq -r '.AZURE_CONTAINER_REGISTRY_NAME.value')" >> "$GITHUB_OUTPUT"
-          echo "acr_login_server=$(echo "$OUTPUTS" | jq -r '.AZURE_CONTAINER_REGISTRY_ENDPOINT.value')" >> "$GITHUB_OUTPUT"
-          echo "aks_cluster_name=$(echo "$OUTPUTS" | jq -r '.AZURE_AKS_CLUSTER_NAME.value')" >> "$GITHUB_OUTPUT"
-          echo "key_vault_name=$(echo "$OUTPUTS" | jq -r '.AZURE_KEY_VAULT_NAME.value')" >> "$GITHUB_OUTPUT"
-          echo "tenant_id=$(echo "$OUTPUTS" | jq -r '.AZURE_TENANT_ID.value')" >> "$GITHUB_OUTPUT"
-          echo "managed_identity_client_id=$(echo "$OUTPUTS" | jq -r '.AZURE_MANAGED_IDENTITY_CLIENT_ID.value')" >> "$GITHUB_OUTPUT"
-          echo "managed_identity_id=$(echo "$OUTPUTS" | jq -r '.AZURE_MANAGED_IDENTITY_ID.value')" >> "$GITHUB_OUTPUT"
+          get_output() {
+            echo "$OUTPUTS" | jq -r --arg name "$1" \
+              'to_entries[] | select(.key | ascii_downcase == ($name | ascii_downcase)) | .value.value'
+          }
+
+          echo "resource_group=$(get_output AZURE_RESOURCE_GROUP)" >> "$GITHUB_OUTPUT"
+          echo "acr_name=$(get_output AZURE_CONTAINER_REGISTRY_NAME)" >> "$GITHUB_OUTPUT"
+          echo "acr_login_server=$(get_output AZURE_CONTAINER_REGISTRY_ENDPOINT)" >> "$GITHUB_OUTPUT"
+          echo "aks_cluster_name=$(get_output AZURE_AKS_CLUSTER_NAME)" >> "$GITHUB_OUTPUT"
+          echo "key_vault_name=$(get_output AZURE_KEY_VAULT_NAME)" >> "$GITHUB_OUTPUT"
+          echo "tenant_id=$(get_output AZURE_TENANT_ID)" >> "$GITHUB_OUTPUT"
+          echo "managed_identity_client_id=$(get_output AZURE_MANAGED_IDENTITY_CLIENT_ID)" >> "$GITHUB_OUTPUT"
+          echo "managed_identity_id=$(get_output AZURE_MANAGED_IDENTITY_ID)" >> "$GITHUB_OUTPUT"
 
       - name: Build and push StoreFront image
         run: |

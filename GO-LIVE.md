@@ -124,7 +124,7 @@ If no quota: pick another region, then update the variable:
 
 ## 7. Commit and push deployment files
 
-- [ ] Push `.github/workflows/deploy.yml` and `plan.md` to `main` (this triggers the workflow).
+- [x] Push `.github/workflows/deploy.yml` and `plan.md` to `main` (this triggers the workflow).
 
 ```bash
 git add .github/workflows/deploy.yml plan.md GO-LIVE.md
@@ -176,6 +176,6 @@ App URLs are also written to the workflow's **job summary** (StoreFront + AdminS
 | 4 | Subscription roles | [x] |
 | 5 | GitHub variables | [x] |
 | 6 | OpenAI quota | [x] |
-| 7 | Push deployment files | [ ] |
+| 7 | Push deployment files | [x] |
 | 8 | Run workflow | [ ] |
 | 9 | Verify live | [ ] |
