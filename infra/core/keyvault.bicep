@@ -7,7 +7,7 @@ param location string = resourceGroup().location
 @description('Tags for the Key Vault')
 param tags object = {}
 
-@description('Principal ID of the user to grant secrets officer role')
+@description('Principal ID of the service principal to grant secrets officer role')
 param principalId string
 
 @description('Principal ID of the managed identity to grant secrets user role')
@@ -40,7 +40,7 @@ resource secretsOfficerRoleAssignment 'Microsoft.Authorization/roleAssignments@2
   properties: {
     roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', 'b86a8fe4-44ce-4948-aee5-eccb2c155cd7') // Key Vault Secrets Officer
     principalId: principalId
-    principalType: 'User'
+    principalType: 'ServicePrincipal'
   }
 }
 
